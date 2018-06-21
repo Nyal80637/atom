@@ -771,6 +771,35 @@ describe('TreeSitterLanguageMode', () => {
   })
 })
 
+describe('Layers', () => {
+  const Layer = (startIndex, grammar, hasChanges) => ({
+    containingNode: {startIndex, hasChanges},
+    grammar,
+    update: jasmine.createSpy(),
+  })
+
+  describe('reconcile(layers, newLayers)', () => {
+    it('updates existing layers', () => {
+      const layers = [
+        Layer(0, 'html', false),
+        Layer(10, 'scss', true),
+        Layer(20, 'css', true),
+      ]
+      const ctx = {}
+      TreeSitterLanguageMode.Layer.reconcile(ctx, layers, [
+        Layer(0, 'html'),
+        Layer(10, 'sql'),
+        Layer(20, 'graphql'),
+      ])
+      const [html, scss, css] = layers
+      expect(html.update.callCount).toBe(0)
+      expect(scss.update.calls.allArgs()).toEqual([ctx])
+      expect(css.update.calls.allArgs()).toEqual([ctx])
+    })
+  })
+})
+
+
 function getDisplayText (editor) {
   return editor.displayLayer.getText()
 }

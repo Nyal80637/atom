@@ -8,17 +8,129 @@ const TextMateLanguageMode = require('./text-mate-language-mode')
 let nextId = 0
 
 class Layer {
-  constructor (grammar, ranges) {
+  constructor (buffer, grammar, ranges, containingNode) {
+    this.buffer = buffer
     this.tree = null
     this.grammar = grammar
     this.ranges = ranges
-    this.injections = []
+    this.injections = {}
+    this.injectors = Object.entries(grammar.injectionPoints)
+    this.containingNode = containingNode
   }
 
-  update(parser) {}
+  static reconcile(ctx, oldInjectionLayers, newInjectionLayers) {
+    let oldInjectionLayerIndex = 0
+    const dirty = []
+    for (const newLayer of newInjectionLayers) {
+      const oldLayer = oldInjectionLayers[oldInjectionLayerIndex]
+      const oldStartIndex = oldLayer.containingNode.startIndex
+      const newStartIndex = newLayer.containingNode.startIndex
+      if (oldStartIndex < newStartIndex) {
+        oldInjectionLayers.splice(oldInjectionLayerIndex, 1)
+      } else if (oldStartIndex > newStartIndex) {
+        oldInjectionLayers.splice(oldInjectionLayerIndex, 0, newLayer)
+        dirty.push(newLayer)
+        ++oldInjectionLayerIndex
+      } else {
+        if (oldLayer.containingNode.hasChanges) {
+          oldLayer.grammar = newLayer.grammar
+          dirty.push(oldLayer)
+        }
+        ++oldInjectionLayerIndex
+      }
+    }
+    return dirty
+  }
+
+  async update (ctx) {
+    const {parser, grammarForLanguage, onRangeUpdate} = ctx
+    parser.setLanguage(this.grammar.languageModule)
+    const tree = await parser.parseTextBuffer(this.buffer.buffer, this.tree, {
+      syncOperationLimit: 1000,
+      includedRanges: this.ranges,
+    })
+    if (this.tree) {
+      this.tree.getChangedRanges(tree).forEach(onRangeUpdate)
+    }
+    this.tree = tree
+
+    let i = this.injectors.length; while (i --> 0) {
+      const [injectionName, {type, language, content}] = this.injectors[i]
+      const oldInjectionLayers = this.injections[injectionName];
+
+      const newInjectionLayers = [];
+      const nodes = tree.rootNode.findAll(type)
+      for (const node of nodes) {
+        const contentNode = content(injectionNode)
+        const languageName = language(injectionNode)
+        if (!languageName) continue
+
+        newInjectionLayers.push(new Layer(
+          this.buffer,
+          grammarForLanguageName(languageName),
+          this.rangesForSubLayer(contentNode),
+          node
+        ))
+      }
+
+      const dirtyLayers = Layer.reconcile(
+        this.injections[injectionName],
+        newInjectionLayers)
+      for (let layer of dirtyLayers) {
+        await layer.update(ctx)
+      }
+    }
+  }
+
+  rangesForSubLayer (node) {
+    const result = [];
+    let position = node.startPosition
+    let index = node.startIndex;
+
+    for (const child of node.children) {
+      const nextPosition = child.startPosition
+      const nextIndex = child.startIndex
+      if (nextIndex > index) {
+        result.push({
+          startIndex: index,
+          endIndex: nextIndex,
+          startPosition: position,
+          endPosition: nextPosition
+        })
+      }
+      position = child.endPosition
+      index = child.endIndex
+    }
+
+    if (node.endIndex > index) {
+      result.push({
+        startIndex: index,
+        endIndex: node.endIndex,
+        startPosition: position,
+        endPosition: node.endPosition
+      })
+    }
+
+    return result
+  }
+
+  treeEditForBufferChange ({oldRange, newRange, oldText, newText}) {
+    const startIndex = this.buffer.characterIndexForPosition(oldRange.start)
+    return {
+      startIndex,
+      oldEndIndex: startIndex + oldText.length,
+      newEndIndex: startIndex + newText.length,
+      startPosition: oldRange.start,
+      oldEndPosition: oldRange.end,
+      newEndPosition: newRange.end
+    }
+  }
+
+  applyChange(bufferChange) {
+    if (this.tree) this.tree.edit(this.treeEditForBufferChange(bufferChange))
+  }
 }
 
-module.exports =
 class TreeSitterLanguageMode {
   constructor ({buffer, grammar, config, grammarRegistry}) {
     this.id = nextId++
@@ -28,7 +140,7 @@ class TreeSitterLanguageMode {
     this.grammarRegistry = grammarRegistry
     this.parser = new Parser()
     this.parser.setLanguage(grammar.languageModule)
-    this.rootLayer = new Layer(grammar)
+    this.rootLayer = new Layer(buffer, grammar)
 
     this.rootScopeDescriptor = new ScopeDescriptor({scopes: [this.grammar.id]})
     this.emitter = new Emitter()
@@ -75,47 +187,33 @@ class TreeSitterLanguageMode {
     const oldEndRow = oldRange.end.row
     const newEndRow = newRange.end.row
     this.isFoldableCache.splice(startRow, oldEndRow - startRow, ...new Array(newEndRow - startRow))
-    this.tree.edit(this.treeEditForBufferChange(change))
+    this.rootLayer.applyChange(change)
   }
 
   /*
   Section - Highlighting
   */
 
-  treeEditForBufferChange ({oldRange, newRange, oldText, newText}) {
-    const startIndex = this.buffer.characterIndexForPosition(oldRange.start)
-    return {
-      startIndex,
-      oldEndIndex: startIndex + oldText.length,
-      newEndIndex: startIndex + newText.length,
-      startPosition: oldRange.start,
-      oldEndPosition: oldRange.end,
-      newEndPosition: newRange.end
+  grammarForLanguage (languageString) {
+    return this.grammarRegistry.treeSitterGrammarForLanguageString(languageString)
+  }
+
+  onRangeUpdate (range) {
+    const startRow = range.start.row
+    const endRow = range.end.row
+    for (let row = startRow; row < endRow; row++) {
+      this.isFoldableCache[row] = undefined
     }
+    this.emitter.emit('did-change-highlighting', range)
   }
 
   async reparse () {
-    this.rootLayer.update(this.parser)
-    const tree = await this.parser.parseTextBuffer(this.buffer.buffer, this.tree, {
-      syncOperationLimit: 1000
-    })
-    const invalidatedRanges = this.tree.getChangedRanges(tree)
+    await this.rootLayer.update(this)
 
-    for (let i = 0, n = invalidatedRanges.length; i < n; i++) {
-      const range = invalidatedRanges[i]
-      const startRow = range.start.row
-      const endRow = range.end.row
-      for (let row = startRow; row < endRow; row++) {
-        this.isFoldableCache[row] = undefined
-      }
-      this.emitter.emit('did-change-highlighting', range)
-    }
-
-    this.tree = tree
     if (this.changeListsSinceCurrentParse.length > 0) {
       for (const changeList of this.changeListsSinceCurrentParse) {
         for (let i = changeList.length - 1; i >= 0; i--) {
-          this.tree.edit(this.treeEditForBufferChange(changeList[i]))
+          this.rootLayer.applyChange(changeList[i])
         }
       }
       this.changeListsSinceCurrentParse.length = 0
@@ -584,8 +682,11 @@ function last (array) {
   return array[array.length - 1]
 }
 
+module.exports = TreeSitterLanguageMode
+TreeSitterLanguageMode.Layer = Layer
+
 // TODO: Remove this once TreeSitterLanguageMode implements its own auto-indent system.
-[
+;[
   '_suggestedIndentForLineWithScopeAtBufferRow',
   'suggestedIndentForEditedBufferRow',
   'increaseIndentRegexForScopeDescriptor',
@@ -593,5 +694,5 @@ function last (array) {
   'decreaseNextIndentRegexForScopeDescriptor',
   'regexForPattern'
 ].forEach(methodName => {
-  module.exports.prototype[methodName] = TextMateLanguageMode.prototype[methodName]
+  TreeSitterLanguageMode.prototype[methodName] = TextMateLanguageMode.prototype[methodName]
 })
